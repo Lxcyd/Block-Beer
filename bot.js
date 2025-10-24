@@ -7,6 +7,8 @@ const {
   ButtonBuilder,
   ButtonStyle,
 } = require("discord.js");
+const fs = require("fs").promises;
+const path = require("path");
 
 const client = new Client({
   intents: [
@@ -31,14 +33,129 @@ const VALID_LOCATIONS = [
   "climb up confluence",
 ];
 
+// Fichiers de sauvegarde
+const DATA_DIR = path.join(__dirname, "data");
+const PARTICIPANTS_FILE = path.join(DATA_DIR, "participants.json");
+const REMINDERS_FILE = path.join(DATA_DIR, "reminders.json");
+
+// Maps pour garder en mémoire (essentiel pour la modification des messages)
 const participants = new Map();
 const reminders = new Map();
 
-// Fonction pour valider et formater le lieu
+// ===== FONCTIONS DE PERSISTANCE =====
+
+async function ensureDataDir() {
+  try {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+  } catch (error) {
+    console.error("Erreur lors de la création du dossier data:", error);
+  }
+}
+
+async function saveParticipants() {
+  try {
+    await ensureDataDir();
+    const data = Array.from(participants.entries());
+    await fs.writeFile(PARTICIPANTS_FILE, JSON.stringify(data, null, 2));
+    console.log(`✅ ${participants.size} événement(s) sauvegardé(s)`);
+  } catch (error) {
+    console.error("❌ Erreur lors de la sauvegarde des participants:", error);
+  }
+}
+
+async function loadParticipants() {
+  try {
+    const data = await fs.readFile(PARTICIPANTS_FILE, "utf8");
+    const entries = JSON.parse(data);
+    participants.clear();
+    entries.forEach(([key, value]) => participants.set(key, value));
+    console.log(`✅ ${participants.size} événement(s) chargé(s) en mémoire`);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      console.log("ℹ️ Aucun fichier de participants trouvé, démarrage à vide");
+    } else {
+      console.error("❌ Erreur lors du chargement des participants:", error);
+    }
+  }
+}
+
+async function saveReminders() {
+  try {
+    await ensureDataDir();
+    const data = Array.from(reminders.entries()).map(([messageId, userMap]) => [
+      messageId,
+      Array.from(userMap.entries()),
+    ]);
+    await fs.writeFile(REMINDERS_FILE, JSON.stringify(data, null, 2));
+    console.log(`✅ ${reminders.size} rappel(s) sauvegardé(s)`);
+  } catch (error) {
+    console.error("❌ Erreur lors de la sauvegarde des rappels:", error);
+  }
+}
+
+async function loadReminders() {
+  try {
+    const data = await fs.readFile(REMINDERS_FILE, "utf8");
+    const entries = JSON.parse(data);
+    reminders.clear();
+    entries.forEach(([messageId, userEntries]) => {
+      const userMap = new Map(userEntries);
+      reminders.set(messageId, userMap);
+    });
+    console.log(`✅ ${reminders.size} rappel(s) chargé(s) en mémoire`);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      console.log("ℹ️ Aucun fichier de rappels trouvé, démarrage à vide");
+    } else {
+      console.error("❌ Erreur lors du chargement des rappels:", error);
+    }
+  }
+}
+
+// Nettoyer les événements expirés (3h après l'heure de l'événement)
+async function cleanExpiredEvents() {
+  const now = Date.now();
+  let cleaned = 0;
+  const messagesToDelete = [];
+
+  for (const [messageId, eventData] of participants.entries()) {
+    const eventTime = getFullDateTime(eventData.date, eventData.heure);
+
+    // Supprimer les événements terminés depuis plus de 3h
+    if (eventTime && eventTime < now - 3 * 60 * 60 * 1000) {
+      messagesToDelete.push(messageId);
+      participants.delete(messageId);
+      reminders.delete(messageId);
+      cleaned++;
+
+      // Essayer de supprimer le message Discord
+      try {
+        const channel = await client.channels.fetch(CHANNEL_ID);
+        const message = await channel.messages.fetch(messageId);
+        await message.delete();
+        console.log(
+          `🗑️ Message Discord ${messageId} supprimé (événement expiré)`
+        );
+      } catch (error) {
+        console.log(`ℹ️ Message ${messageId} déjà supprimé ou introuvable`);
+      }
+    }
+  }
+
+  if (cleaned > 0) {
+    console.log(
+      `🧹 ${cleaned} événement(s) expiré(s) supprimé(s) de la mémoire et des fichiers`
+    );
+    await saveParticipants();
+    await saveReminders();
+  }
+}
+
+// ===== FONCTIONS DE VALIDATION =====
+
 function validateLocation(location) {
   const normalized = location.toLowerCase().trim();
 
-  // Vérifier si le lieu est valide
   const isValid = VALID_LOCATIONS.some(
     (validLoc) =>
       normalized === validLoc ||
@@ -47,7 +164,6 @@ function validateLocation(location) {
 
   if (!isValid) return null;
 
-  // Retourner la version capitalisée
   if (normalized.includes("laennec")) return "Laennec";
   if (normalized.includes("part") || normalized.includes("dieu"))
     return "Part Dieu";
@@ -58,7 +174,6 @@ function validateLocation(location) {
   return null;
 }
 
-// Fonction pour valider et parser l'heure
 function validateAndParseHeure(heureStr) {
   let normalized = heureStr.toLowerCase().replace(/[,. ]/g, "h");
   if (!normalized.includes("h")) normalized += "h";
@@ -67,16 +182,13 @@ function validateAndParseHeure(heureStr) {
   const hours = parseInt(parts[0]);
   const minutes = parts[1] ? parseInt(parts[1]) : 0;
 
-  // Validation
   if (isNaN(hours) || hours < 7 || hours > 23) return null;
   if (isNaN(minutes) || minutes < 0 || minutes > 59) return null;
 
-  // Format de sortie
   if (minutes === 0) return `${hours}h`;
   return `${hours}h${minutes.toString().padStart(2, "0")}`;
 }
 
-// Fonction pour parser la date
 function parseDate(dateStr) {
   const now = new Date();
   const daysOfWeek = [
@@ -130,8 +242,6 @@ function parseDate(dateStr) {
 
     let targetDate = new Date(year, month, day);
 
-    // Si la date est dans le passé (avant aujourd'hui), ajouter un an
-    // On compare sans les heures pour ne regarder que la date
     const todayStart = new Date(
       now.getFullYear(),
       now.getMonth(),
@@ -153,9 +263,7 @@ function parseDate(dateStr) {
   return null;
 }
 
-// Fonction pour obtenir le nom du jour en français (ou "Aujourd'hui")
 function getDayName(date, originalDateStr) {
-  // Si c'est aujourd'hui
   if (
     originalDateStr &&
     (originalDateStr.toLowerCase() === "aujourd'hui" ||
@@ -176,7 +284,6 @@ function getDayName(date, originalDateStr) {
   return days[date.getDay()];
 }
 
-// Fonction pour créer un timestamp Discord
 function createTimestamp(dateStr, heureStr, format = "t") {
   try {
     const date = parseDate(dateStr);
@@ -196,7 +303,6 @@ function createTimestamp(dateStr, heureStr, format = "t") {
   }
 }
 
-// Fonction pour obtenir la date complète
 function getFullDateTime(dateStr, heureStr) {
   try {
     const date = parseDate(dateStr);
@@ -214,18 +320,40 @@ function getFullDateTime(dateStr, heureStr) {
   }
 }
 
-client.once("ready", async () => {
-  console.log(`Bot connecté en tant que ${client.user.tag}`);
+// ===== CLIENT READY =====
 
-  // Définir l'activité personnalisée du bot
+client.once("ready", async () => {
+  console.log(`\n🤖 Bot connecté en tant que ${client.user.tag}`);
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+  // 1. Charger les données sauvegardées EN MÉMOIRE
+  console.log("📂 Chargement des données...");
+  await loadParticipants();
+  await loadReminders();
+  console.log(
+    `💾 Mémoire: ${participants.size} événement(s), ${reminders.size} rappel(s)\n`
+  );
+
+  // 2. Nettoyer les événements expirés
+  console.log("🧹 Nettoyage des événements expirés...");
+  await cleanExpiredEvents();
+  console.log("");
+
+  // 3. Restaurer les messages Discord (reconnexion aux boutons)
+  console.log("🔄 Restauration des messages Discord...");
+  await restoreMessages();
+  console.log("");
+
+  // 4. Configurer l'activité du bot
   client.user.setActivity({
-    type: 4, // ActivityType.Custom
+    type: 4,
     name: "customstatus",
     state: "/grimpe",
   });
 
+  // 5. Enregistrer la commande slash
   try {
-    console.log("Enregistrement de la commande slash /grimpe...");
+    console.log("📝 Enregistrement de la commande slash /grimpe...");
 
     await client.application.commands.create({
       name: "grimpe",
@@ -265,15 +393,105 @@ client.once("ready", async () => {
       ],
     });
 
-    console.log("Commande slash enregistrée avec succès !");
+    console.log("✅ Commande slash enregistrée avec succès !");
   } catch (error) {
-    console.error("Erreur:", error);
+    console.error("❌ Erreur lors de l'enregistrement:", error);
   }
 
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("✨ Bot prêt et opérationnel !\n");
+
+  // 6. Intervalles de maintenance
+  // Vérifier les rappels toutes les minutes
   setInterval(checkReminders, 60000);
+
+  // Sauvegarder automatiquement toutes les 5 minutes (sécurité)
+  setInterval(async () => {
+    console.log("💾 Sauvegarde automatique...");
+    await saveParticipants();
+    await saveReminders();
+  }, 5 * 60 * 1000);
+
+  // Nettoyer les événements expirés toutes les heures
+  setInterval(async () => {
+    console.log("🧹 Nettoyage automatique...");
+    await cleanExpiredEvents();
+  }, 60 * 60 * 1000);
 });
 
-// Fonction pour envoyer un message qui se supprime avec compteur décrémentant
+// Restaurer les messages après redémarrage
+async function restoreMessages() {
+  try {
+    const targetChannel = await client.channels.fetch(CHANNEL_ID);
+    let restored = 0;
+    let deleted = 0;
+
+    for (const [messageId, eventData] of participants.entries()) {
+      try {
+        // Essayer de récupérer le message Discord
+        const message = await targetChannel.messages.fetch(messageId);
+
+        // Recréer l'embed et les boutons pour que les interactions fonctionnent
+        const embed = createGrimpeEmbed(
+          eventData.date,
+          eventData.heure,
+          eventData.localisation,
+          eventData.infos,
+          eventData.author,
+          eventData.list,
+          eventData.guildId,
+          eventData.originalDateStr
+        );
+
+        const presentButton = new ButtonBuilder()
+          .setCustomId("present")
+          .setLabel("Présent")
+          .setStyle(ButtonStyle.Success);
+
+        const absentButton = new ButtonBuilder()
+          .setCustomId("absent")
+          .setLabel("Absent")
+          .setStyle(ButtonStyle.Danger);
+
+        const reminderButton = new ButtonBuilder()
+          .setCustomId("reminder")
+          .setLabel("🔔 Rappel")
+          .setStyle(ButtonStyle.Primary);
+
+        const row = new ActionRowBuilder().addComponents(
+          presentButton,
+          absentButton,
+          reminderButton
+        );
+
+        // Mettre à jour le message avec les nouveaux boutons (reconnexion)
+        await message.edit({ embeds: [embed], components: [row] });
+        restored++;
+        console.log(`✅ Message ${messageId} restauré et reconnecté`);
+      } catch (error) {
+        // Si le message n'existe plus, le supprimer de la mémoire et des fichiers
+        console.log(
+          `❌ Message ${messageId} introuvable, suppression des données`
+        );
+        participants.delete(messageId);
+        reminders.delete(messageId);
+        deleted++;
+      }
+    }
+
+    if (deleted > 0) {
+      await saveParticipants();
+      await saveReminders();
+    }
+
+    console.log(
+      `📊 Restauration: ${restored} message(s) reconnecté(s), ${deleted} supprimé(s)`
+    );
+  } catch (error) {
+    console.error("❌ Erreur lors de la restauration des messages:", error);
+  }
+}
+
 async function sendTemporaryReply(interaction, content, duration = 10000) {
   const seconds = Math.floor(duration / 1000);
   let remaining = seconds;
@@ -283,7 +501,6 @@ async function sendTemporaryReply(interaction, content, duration = 10000) {
     ephemeral: true,
   });
 
-  // Décrémenter le compteur chaque seconde
   const interval = setInterval(async () => {
     remaining--;
     if (remaining > 0) {
@@ -305,9 +522,9 @@ async function sendTemporaryReply(interaction, content, duration = 10000) {
   }, duration);
 }
 
-// Vérifier les rappels
 async function checkReminders() {
   const now = Date.now();
+  let remindersSent = 0;
 
   for (const [messageId, eventReminders] of reminders.entries()) {
     for (const [userId, reminderTime] of eventReminders.entries()) {
@@ -334,18 +551,29 @@ async function checkReminders() {
               .setTimestamp();
 
             await user.send({ embeds: [embed] });
+            console.log(
+              `🔔 Rappel envoyé à ${user.username} pour l'événement ${messageId}`
+            );
+            remindersSent++;
           }
 
+          // Supprimer le rappel après l'envoi
           eventReminders.delete(userId);
         } catch (error) {
-          console.error("Erreur lors de l'envoi du rappel:", error);
+          console.error("❌ Erreur lors de l'envoi du rappel:", error);
+          // Supprimer le rappel même en cas d'erreur pour éviter les boucles
+          eventReminders.delete(userId);
         }
       }
     }
   }
+
+  // Sauvegarder après avoir envoyé les rappels
+  if (remindersSent > 0) {
+    await saveReminders();
+  }
 }
 
-// Fonction pour créer l'embed
 function createGrimpeEmbed(
   date,
   heure,
@@ -391,10 +619,10 @@ function createGrimpeEmbed(
   return embed;
 }
 
-// Gestion des interactions
+// ===== GESTION DES INTERACTIONS =====
+
 client.on("interactionCreate", async (interaction) => {
   if (interaction.isCommand() && interaction.commandName === "grimpe") {
-    // Vérifier si la commande est utilisée dans un channel autorisé
     if (!ALLOWED_COMMAND_CHANNELS.includes(interaction.channelId)) {
       return sendTemporaryReply(
         interaction,
@@ -407,7 +635,6 @@ client.on("interactionCreate", async (interaction) => {
     const localisation = interaction.options.getString("localisation");
     const infos = interaction.options.getString("infos");
 
-    // Validation de la date
     const parsedDate = parseDate(date);
     if (!parsedDate) {
       return sendTemporaryReply(
@@ -416,7 +643,6 @@ client.on("interactionCreate", async (interaction) => {
       );
     }
 
-    // Validation de l'heure
     const heure = validateAndParseHeure(heureInput);
     if (!heure) {
       return sendTemporaryReply(
@@ -425,7 +651,6 @@ client.on("interactionCreate", async (interaction) => {
       );
     }
 
-    // Validation du lieu (déjà validé par les choices mais on garde la logique)
     const validLocation = validateLocation(localisation);
     if (!validLocation) {
       return sendTemporaryReply(
@@ -486,6 +711,8 @@ client.on("interactionCreate", async (interaction) => {
 
     await sendTemporaryReply(interaction, "✅ Session de grimpe créée !");
 
+    // Stocker l'événement EN MÉMOIRE avec le messageId comme clé
+    // C'est ce qui permet de modifier le message plus tard !
     participants.set(message.id, {
       date,
       heure,
@@ -498,16 +725,23 @@ client.on("interactionCreate", async (interaction) => {
     });
 
     reminders.set(message.id, new Map());
+
+    // Sauvegarder immédiatement dans les fichiers
+    console.log(`💾 Nouvel événement créé: ${message.id}`);
+    await saveParticipants();
+    await saveReminders();
   }
 
   if (interaction.isButton()) {
     const messageId = interaction.message.id;
+
+    // Récupérer l'événement EN MÉMOIRE grâce au messageId
     const eventData = participants.get(messageId);
 
     if (!eventData) {
       return sendTemporaryReply(
         interaction,
-        "❌ Erreur: événement introuvable."
+        "❌ Erreur: événement introuvable en mémoire."
       );
     }
 
@@ -522,17 +756,20 @@ client.on("interactionCreate", async (interaction) => {
       if (isAlreadyParticipating) {
         await sendTemporaryReply(interaction, "⚠️ Vous êtes déjà inscrit !");
       } else {
+        // Modifier les données EN MÉMOIRE
         eventData.list.push({
           id: userId,
           username: interaction.user.username,
           displayName: displayName,
           avatar: userAvatar,
         });
+
         await sendTemporaryReply(
           interaction,
           "✅ Vous êtes maintenant inscrit à la session !"
         );
 
+        // Mettre à jour le message Discord
         const updatedEmbed = createGrimpeEmbed(
           eventData.date,
           eventData.heure,
@@ -544,6 +781,12 @@ client.on("interactionCreate", async (interaction) => {
           eventData.originalDateStr
         );
         await interaction.message.edit({ embeds: [updatedEmbed] });
+
+        // Sauvegarder dans le fichier
+        console.log(
+          `💾 Participant ajouté: ${displayName} -> événement ${messageId}`
+        );
+        await saveParticipants();
       }
     } else if (interaction.customId === "absent") {
       if (!isAlreadyParticipating) {
@@ -552,12 +795,15 @@ client.on("interactionCreate", async (interaction) => {
           "⚠️ Vous n'êtes pas inscrit à cette session."
         );
       } else {
+        // Modifier les données EN MÉMOIRE
         eventData.list = eventData.list.filter((p) => p.id !== userId);
+
         await sendTemporaryReply(
           interaction,
           "❌ Vous avez été retiré de la liste des participants."
         );
 
+        // Mettre à jour le message Discord
         const updatedEmbed = createGrimpeEmbed(
           eventData.date,
           eventData.heure,
@@ -569,6 +815,12 @@ client.on("interactionCreate", async (interaction) => {
           eventData.originalDateStr
         );
         await interaction.message.edit({ embeds: [updatedEmbed] });
+
+        // Sauvegarder dans le fichier
+        console.log(
+          `💾 Participant retiré: ${displayName} -> événement ${messageId}`
+        );
+        await saveParticipants();
       }
     } else if (interaction.customId === "reminder") {
       const eventTime = getFullDateTime(eventData.date, eventData.heure);
@@ -580,7 +832,7 @@ client.on("interactionCreate", async (interaction) => {
         );
       }
 
-      const reminderTime = eventTime - 60 * 60 * 1000; // Rappel 1h avant
+      const reminderTime = eventTime - 60 * 60 * 1000;
       const now = Date.now();
 
       if (reminderTime <= now) {
@@ -592,12 +844,21 @@ client.on("interactionCreate", async (interaction) => {
 
       const eventReminders = reminders.get(messageId);
       if (eventReminders.has(userId)) {
-        // Si l'utilisateur a déjà un rappel, on le supprime
+        // Supprimer le rappel EN MÉMOIRE
         eventReminders.delete(userId);
+        console.log(
+          `🔕 Rappel supprimé: ${interaction.user.username} -> événement ${messageId}`
+        );
+        await saveReminders();
         return sendTemporaryReply(interaction, "🔕 Rappel supprimé !");
       }
 
+      // Ajouter le rappel EN MÉMOIRE
       eventReminders.set(userId, reminderTime);
+      console.log(
+        `🔔 Rappel configuré: ${interaction.user.username} -> événement ${messageId}`
+      );
+      await saveReminders();
 
       await sendTemporaryReply(
         interaction,
