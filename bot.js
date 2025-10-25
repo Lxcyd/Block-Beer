@@ -322,7 +322,7 @@ function getFullDateTime(dateStr, heureStr) {
 
 // ===== CLIENT READY =====
 
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   console.log(`\n🤖 Bot connecté en tant que ${client.user.tag}`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
