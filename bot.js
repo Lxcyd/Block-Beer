@@ -6,9 +6,11 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  PermissionFlagsBits,
 } = require("discord.js");
-const fs = require("fs").promises;
-const path = require("path");
 
 const client = new Client({
   intents: [
@@ -33,123 +35,9 @@ const VALID_LOCATIONS = [
   "climb up confluence",
 ];
 
-// Fichiers de sauvegarde
-const DATA_DIR = path.join(__dirname, "data");
-const PARTICIPANTS_FILE = path.join(DATA_DIR, "participants.json");
-const REMINDERS_FILE = path.join(DATA_DIR, "reminders.json");
-
-// Maps pour garder en mémoire (essentiel pour la modification des messages)
+// Maps pour garder en mémoire
 const participants = new Map();
 const reminders = new Map();
-
-// ===== FONCTIONS DE PERSISTANCE =====
-
-async function ensureDataDir() {
-  try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-  } catch (error) {
-    console.error("Erreur lors de la création du dossier data:", error);
-  }
-}
-
-async function saveParticipants() {
-  try {
-    await ensureDataDir();
-    const data = Array.from(participants.entries());
-    await fs.writeFile(PARTICIPANTS_FILE, JSON.stringify(data, null, 2));
-    console.log(`✅ ${participants.size} événement(s) sauvegardé(s)`);
-  } catch (error) {
-    console.error("❌ Erreur lors de la sauvegarde des participants:", error);
-  }
-}
-
-async function loadParticipants() {
-  try {
-    const data = await fs.readFile(PARTICIPANTS_FILE, "utf8");
-    const entries = JSON.parse(data);
-    participants.clear();
-    entries.forEach(([key, value]) => participants.set(key, value));
-    console.log(`✅ ${participants.size} événement(s) chargé(s) en mémoire`);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      console.log("ℹ️ Aucun fichier de participants trouvé, démarrage à vide");
-    } else {
-      console.error("❌ Erreur lors du chargement des participants:", error);
-    }
-  }
-}
-
-async function saveReminders() {
-  try {
-    await ensureDataDir();
-    const data = Array.from(reminders.entries()).map(([messageId, userMap]) => [
-      messageId,
-      Array.from(userMap.entries()),
-    ]);
-    await fs.writeFile(REMINDERS_FILE, JSON.stringify(data, null, 2));
-    console.log(`✅ ${reminders.size} rappel(s) sauvegardé(s)`);
-  } catch (error) {
-    console.error("❌ Erreur lors de la sauvegarde des rappels:", error);
-  }
-}
-
-async function loadReminders() {
-  try {
-    const data = await fs.readFile(REMINDERS_FILE, "utf8");
-    const entries = JSON.parse(data);
-    reminders.clear();
-    entries.forEach(([messageId, userEntries]) => {
-      const userMap = new Map(userEntries);
-      reminders.set(messageId, userMap);
-    });
-    console.log(`✅ ${reminders.size} rappel(s) chargé(s) en mémoire`);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      console.log("ℹ️ Aucun fichier de rappels trouvé, démarrage à vide");
-    } else {
-      console.error("❌ Erreur lors du chargement des rappels:", error);
-    }
-  }
-}
-
-// Nettoyer les événements expirés (3h après l'heure de l'événement)
-async function cleanExpiredEvents() {
-  const now = Date.now();
-  let cleaned = 0;
-  const messagesToDelete = [];
-
-  for (const [messageId, eventData] of participants.entries()) {
-    const eventTime = getFullDateTime(eventData.date, eventData.heure);
-
-    // Supprimer les événements terminés depuis plus de 3h
-    if (eventTime && eventTime < now - 3 * 60 * 60 * 1000) {
-      messagesToDelete.push(messageId);
-      participants.delete(messageId);
-      reminders.delete(messageId);
-      cleaned++;
-
-      // Essayer de supprimer le message Discord
-      try {
-        const channel = await client.channels.fetch(CHANNEL_ID);
-        const message = await channel.messages.fetch(messageId);
-        await message.delete();
-        console.log(
-          `🗑️ Message Discord ${messageId} supprimé (événement expiré)`
-        );
-      } catch (error) {
-        console.log(`ℹ️ Message ${messageId} déjà supprimé ou introuvable`);
-      }
-    }
-  }
-
-  if (cleaned > 0) {
-    console.log(
-      `🧹 ${cleaned} événement(s) expiré(s) supprimé(s) de la mémoire et des fichiers`
-    );
-    await saveParticipants();
-    await saveReminders();
-  }
-}
 
 // ===== FONCTIONS DE VALIDATION =====
 
@@ -204,11 +92,11 @@ function parseDate(dateStr) {
   dateStr = dateStr.toLowerCase().trim();
 
   if (dateStr === "aujourd'hui" || dateStr === "aujourdhui") {
-    return new Date(now);
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
   }
 
   if (dateStr === "demain") {
-    const tomorrow = new Date(now);
+    const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     tomorrow.setDate(tomorrow.getDate() + 1);
     return tomorrow;
   }
@@ -217,8 +105,12 @@ function parseDate(dateStr) {
   if (dayIndex !== -1) {
     const currentDay = now.getDay();
     let daysToAdd = dayIndex - currentDay;
-    if (daysToAdd <= 0) daysToAdd += 7;
-    const targetDate = new Date(now);
+    
+    if (daysToAdd < 0) {
+      daysToAdd += 7;
+    }
+    
+    const targetDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     targetDate.setDate(targetDate.getDate() + daysToAdd);
     return targetDate;
   }
@@ -320,38 +212,58 @@ function getFullDateTime(dateStr, heureStr) {
   }
 }
 
+// Vérifier si l'utilisateur est admin
+function isAdmin(member) {
+  return member.permissions.has(PermissionFlagsBits.Administrator);
+}
+
+// Nettoyer les événements expirés (3h après l'heure de l'événement)
+async function cleanExpiredEvents() {
+  const now = Date.now();
+  let cleaned = 0;
+
+  for (const [messageId, eventData] of participants.entries()) {
+    const eventTime = getFullDateTime(eventData.date, eventData.heure);
+
+    if (eventTime && eventTime < now - 3 * 60 * 60 * 1000) {
+      participants.delete(messageId);
+      reminders.delete(messageId);
+      cleaned++;
+
+      try {
+        const channel = await client.channels.fetch(CHANNEL_ID);
+        const message = await channel.messages.fetch(messageId);
+        await message.delete();
+        console.log(
+          `🗑️ Message Discord ${messageId} supprimé (événement expiré)`
+        );
+      } catch (error) {
+        console.log(`ℹ️ Message ${messageId} déjà supprimé ou introuvable`);
+      }
+    }
+  }
+
+  if (cleaned > 0) {
+    console.log(`🧹 ${cleaned} événement(s) expiré(s) supprimé(s) de la mémoire`);
+  }
+}
+
 // ===== CLIENT READY =====
 
-client.once("clientReady", async () => {
+client.once("ready", async () => {
   console.log(`\n🤖 Bot connecté en tant que ${client.user.tag}`);
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
-  // 1. Charger les données sauvegardées EN MÉMOIRE
-  console.log("📂 Chargement des données...");
-  await loadParticipants();
-  await loadReminders();
-  console.log(
-    `💾 Mémoire: ${participants.size} événement(s), ${reminders.size} rappel(s)\n`
-  );
-
-  // 2. Nettoyer les événements expirés
   console.log("🧹 Nettoyage des événements expirés...");
   await cleanExpiredEvents();
   console.log("");
 
-  // 3. Restaurer les messages Discord (reconnexion aux boutons)
-  console.log("🔄 Restauration des messages Discord...");
-  await restoreMessages();
-  console.log("");
-
-  // 4. Configurer l'activité du bot
   client.user.setActivity({
     type: 4,
     name: "customstatus",
     state: "/grimpe",
   });
 
-  // 5. Enregistrer la commande slash
   try {
     console.log("📝 Enregistrement de la commande slash /grimpe...");
 
@@ -398,106 +310,23 @@ client.once("clientReady", async () => {
     console.error("❌ Erreur lors de l'enregistrement:", error);
   }
 
-  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log("✨ Bot prêt et opérationnel !\n");
 
-  // 6. Intervalles de maintenance
-  // Vérifier les rappels toutes les minutes
   setInterval(checkReminders, 60000);
 
-  // Sauvegarder automatiquement toutes les 5 minutes (sécurité)
-  setInterval(async () => {
-    console.log("💾 Sauvegarde automatique...");
-    await saveParticipants();
-    await saveReminders();
-  }, 5 * 60 * 1000);
-
-  // Nettoyer les événements expirés toutes les heures
   setInterval(async () => {
     console.log("🧹 Nettoyage automatique...");
     await cleanExpiredEvents();
   }, 60 * 60 * 1000);
 });
 
-// Restaurer les messages après redémarrage
-async function restoreMessages() {
-  try {
-    const targetChannel = await client.channels.fetch(CHANNEL_ID);
-    let restored = 0;
-    let deleted = 0;
-
-    for (const [messageId, eventData] of participants.entries()) {
-      try {
-        // Essayer de récupérer le message Discord
-        const message = await targetChannel.messages.fetch(messageId);
-
-        // Recréer l'embed et les boutons pour que les interactions fonctionnent
-        const embed = createGrimpeEmbed(
-          eventData.date,
-          eventData.heure,
-          eventData.localisation,
-          eventData.infos,
-          eventData.author,
-          eventData.list,
-          eventData.guildId,
-          eventData.originalDateStr
-        );
-
-        const presentButton = new ButtonBuilder()
-          .setCustomId("present")
-          .setLabel("Présent")
-          .setStyle(ButtonStyle.Success);
-
-        const absentButton = new ButtonBuilder()
-          .setCustomId("absent")
-          .setLabel("Absent")
-          .setStyle(ButtonStyle.Danger);
-
-        const reminderButton = new ButtonBuilder()
-          .setCustomId("reminder")
-          .setLabel("🔔 Rappel")
-          .setStyle(ButtonStyle.Primary);
-
-        const row = new ActionRowBuilder().addComponents(
-          presentButton,
-          absentButton,
-          reminderButton
-        );
-
-        // Mettre à jour le message avec les nouveaux boutons (reconnexion)
-        await message.edit({ embeds: [embed], components: [row] });
-        restored++;
-        console.log(`✅ Message ${messageId} restauré et reconnecté`);
-      } catch (error) {
-        // Si le message n'existe plus, le supprimer de la mémoire et des fichiers
-        console.log(
-          `❌ Message ${messageId} introuvable, suppression des données`
-        );
-        participants.delete(messageId);
-        reminders.delete(messageId);
-        deleted++;
-      }
-    }
-
-    if (deleted > 0) {
-      await saveParticipants();
-      await saveReminders();
-    }
-
-    console.log(
-      `📊 Restauration: ${restored} message(s) reconnecté(s), ${deleted} supprimé(s)`
-    );
-  } catch (error) {
-    console.error("❌ Erreur lors de la restauration des messages:", error);
-  }
-}
-
 async function sendTemporaryReply(interaction, content, duration = 10000) {
   const seconds = Math.floor(duration / 1000);
   let remaining = seconds;
 
-  const reply = await interaction.reply({
-    content: `${content} (Suppression automatique : ${remaining})`,
+  await interaction.reply({
+    content: `${content} (Suppression automatique : ${remaining}s)`,
     ephemeral: true,
   });
 
@@ -506,7 +335,7 @@ async function sendTemporaryReply(interaction, content, duration = 10000) {
     if (remaining > 0) {
       try {
         await interaction.editReply({
-          content: `${content} (Suppression automatique : ${remaining})`,
+          content: `${content} (Suppression automatique : ${remaining}s)`,
         });
       } catch (error) {
         clearInterval(interval);
@@ -557,20 +386,13 @@ async function checkReminders() {
             remindersSent++;
           }
 
-          // Supprimer le rappel après l'envoi
           eventReminders.delete(userId);
         } catch (error) {
           console.error("❌ Erreur lors de l'envoi du rappel:", error);
-          // Supprimer le rappel même en cas d'erreur pour éviter les boucles
           eventReminders.delete(userId);
         }
       }
     }
-  }
-
-  // Sauvegarder après avoir envoyé les rappels
-  if (remindersSent > 0) {
-    await saveReminders();
   }
 }
 
@@ -619,9 +441,45 @@ function createGrimpeEmbed(
   return embed;
 }
 
+function createButtons(isAdmin = false) {
+  const presentButton = new ButtonBuilder()
+    .setCustomId("present")
+    .setLabel("Présent")
+    .setStyle(ButtonStyle.Success);
+
+  const absentButton = new ButtonBuilder()
+    .setCustomId("absent")
+    .setLabel("Absent")
+    .setStyle(ButtonStyle.Danger);
+
+  const reminderButton = new ButtonBuilder()
+    .setCustomId("reminder")
+    .setLabel("🔔 Rappel")
+    .setStyle(ButtonStyle.Primary);
+
+  const row1 = new ActionRowBuilder().addComponents(
+    presentButton,
+    absentButton,
+    reminderButton
+  );
+
+  if (isAdmin) {
+    const editButton = new ButtonBuilder()
+      .setCustomId("edit")
+      .setLabel("✏️ Modifier")
+      .setStyle(ButtonStyle.Secondary);
+
+    const row2 = new ActionRowBuilder().addComponents(editButton);
+    return [row1, row2];
+  }
+
+  return [row1];
+}
+
 // ===== GESTION DES INTERACTIONS =====
 
 client.on("interactionCreate", async (interaction) => {
+  // Commande /grimpe
   if (interaction.isCommand() && interaction.commandName === "grimpe") {
     if (!ALLOWED_COMMAND_CHANNELS.includes(interaction.channelId)) {
       return sendTemporaryReply(
@@ -678,32 +536,13 @@ client.on("interactionCreate", async (interaction) => {
       date
     );
 
-    const presentButton = new ButtonBuilder()
-      .setCustomId("present")
-      .setLabel("Présent")
-      .setStyle(ButtonStyle.Success);
-
-    const absentButton = new ButtonBuilder()
-      .setCustomId("absent")
-      .setLabel("Absent")
-      .setStyle(ButtonStyle.Danger);
-
-    const reminderButton = new ButtonBuilder()
-      .setCustomId("reminder")
-      .setLabel("🔔 Rappel")
-      .setStyle(ButtonStyle.Primary);
-
-    const row = new ActionRowBuilder().addComponents(
-      presentButton,
-      absentButton,
-      reminderButton
-    );
+    const buttons = createButtons(isAdmin(member));
 
     const targetChannel = await client.channels.fetch(CHANNEL_ID);
 
     const message = await targetChannel.send({
       embeds: [embed],
-      components: [row],
+      components: buttons,
     });
 
     const pingMessage = await targetChannel.send(`<@&${ROLE_ID}>`);
@@ -711,8 +550,6 @@ client.on("interactionCreate", async (interaction) => {
 
     await sendTemporaryReply(interaction, "✅ Session de grimpe créée !");
 
-    // Stocker l'événement EN MÉMOIRE avec le messageId comme clé
-    // C'est ce qui permet de modifier le message plus tard !
     participants.set(message.id, {
       date,
       heure,
@@ -726,16 +563,169 @@ client.on("interactionCreate", async (interaction) => {
 
     reminders.set(message.id, new Map());
 
-    // Sauvegarder immédiatement dans les fichiers
     console.log(`💾 Nouvel événement créé: ${message.id}`);
-    await saveParticipants();
-    await saveReminders();
   }
 
-  if (interaction.isButton()) {
-    const messageId = interaction.message.id;
+  // Bouton Edit (admin uniquement)
+  if (interaction.isButton() && interaction.customId === "edit") {
+    const member = interaction.member;
 
-    // Récupérer l'événement EN MÉMOIRE grâce au messageId
+    if (!isAdmin(member)) {
+      return sendTemporaryReply(
+        interaction,
+        "❌ Seuls les administrateurs peuvent modifier l'événement !"
+      );
+    }
+
+    const messageId = interaction.message.id;
+    const eventData = participants.get(messageId);
+
+    if (!eventData) {
+      return sendTemporaryReply(
+        interaction,
+        "❌ Erreur: événement introuvable en mémoire."
+      );
+    }
+
+    // Créer le modal pour modifier l'événement
+    const modal = new ModalBuilder()
+      .setCustomId(`edit_event_${messageId}`)
+      .setTitle("Modifier la session de grimpe");
+
+    const dateInput = new TextInputBuilder()
+      .setCustomId("date")
+      .setLabel("Date (ex: 25/10, aujourd'hui, lundi)")
+      .setStyle(TextInputStyle.Short)
+      .setValue(eventData.originalDateStr)
+      .setRequired(true);
+
+    const heureInput = new TextInputBuilder()
+      .setCustomId("heure")
+      .setLabel("Heure (ex: 18h30, 19h)")
+      .setStyle(TextInputStyle.Short)
+      .setValue(eventData.heure)
+      .setRequired(true);
+
+    const localisationInput = new TextInputBuilder()
+      .setCustomId("localisation")
+      .setLabel("Lieu (Laennec, Part Dieu, etc.)")
+      .setStyle(TextInputStyle.Short)
+      .setValue(eventData.localisation)
+      .setRequired(true);
+
+    const infosInput = new TextInputBuilder()
+      .setCustomId("infos")
+      .setLabel("Informations complémentaires")
+      .setStyle(TextInputStyle.Paragraph)
+      .setValue(eventData.infos || "")
+      .setRequired(false);
+
+    const row1 = new ActionRowBuilder().addComponents(dateInput);
+    const row2 = new ActionRowBuilder().addComponents(heureInput);
+    const row3 = new ActionRowBuilder().addComponents(localisationInput);
+    const row4 = new ActionRowBuilder().addComponents(infosInput);
+
+    modal.addComponents(row1, row2, row3, row4);
+
+    await interaction.showModal(modal);
+  }
+
+  // Soumission du modal d'édition
+  if (interaction.isModalSubmit() && interaction.customId.startsWith("edit_event_")) {
+    const messageId = interaction.customId.replace("edit_event_", "");
+    const eventData = participants.get(messageId);
+
+    if (!eventData) {
+      return sendTemporaryReply(
+        interaction,
+        "❌ Erreur: événement introuvable en mémoire."
+      );
+    }
+
+    const newDate = interaction.fields.getTextInputValue("date");
+    const newHeureInput = interaction.fields.getTextInputValue("heure");
+    const newLocalisation = interaction.fields.getTextInputValue("localisation");
+    const newInfos = interaction.fields.getTextInputValue("infos");
+
+    // Valider la nouvelle date
+    const parsedDate = parseDate(newDate);
+    if (!parsedDate) {
+      return sendTemporaryReply(
+        interaction,
+        '❌ Date invalide ! Utilisez : un jour (lundi, mardi...), une date (25/10), "aujourd\'hui" ou "demain"'
+      );
+    }
+
+    // Valider la nouvelle heure
+    const newHeure = validateAndParseHeure(newHeureInput);
+    if (!newHeure) {
+      return sendTemporaryReply(
+        interaction,
+        "❌ Heure invalide ! Utilisez une heure entre 7h et 23h (ex: 18h30, 19h)"
+      );
+    }
+
+    // Valider le nouveau lieu
+    const validLocation = validateLocation(newLocalisation);
+    if (!validLocation) {
+      return sendTemporaryReply(
+        interaction,
+        "❌ Lieu invalide ! Choisissez : Laennec, Part Dieu, Villeurbanne, Climb Up Gerland ou Climb Up Confluence"
+      );
+    }
+
+    // Mettre à jour les données
+    eventData.date = newDate;
+    eventData.heure = newHeure;
+    eventData.localisation = validLocation;
+    eventData.infos = newInfos;
+    eventData.originalDateStr = newDate;
+
+    // Mettre à jour les rappels avec le nouveau timing
+    const newEventTime = getFullDateTime(newDate, newHeure);
+    if (newEventTime) {
+      const newReminderTime = newEventTime - 60 * 60 * 1000;
+      const eventReminders = reminders.get(messageId);
+      if (eventReminders) {
+        for (const userId of eventReminders.keys()) {
+          eventReminders.set(userId, newReminderTime);
+        }
+      }
+    }
+
+    // Mettre à jour le message Discord
+    const updatedEmbed = createGrimpeEmbed(
+      eventData.date,
+      eventData.heure,
+      eventData.localisation,
+      eventData.infos,
+      eventData.author,
+      eventData.list,
+      eventData.guildId,
+      eventData.originalDateStr
+    );
+
+    const member = interaction.member;
+    const buttons = createButtons(isAdmin(member));
+
+    await interaction.message.edit({ 
+      embeds: [updatedEmbed],
+      components: buttons
+    });
+
+    await sendTemporaryReply(
+      interaction,
+      "✅ Événement modifié avec succès !"
+    );
+
+    console.log(
+      `✏️ Événement ${messageId} modifié par ${interaction.user.username}`
+    );
+  }
+
+  // Boutons existants (Présent, Absent, Rappel)
+  if (interaction.isButton() && ["present", "absent", "reminder"].includes(interaction.customId)) {
+    const messageId = interaction.message.id;
     const eventData = participants.get(messageId);
 
     if (!eventData) {
@@ -756,7 +746,6 @@ client.on("interactionCreate", async (interaction) => {
       if (isAlreadyParticipating) {
         await sendTemporaryReply(interaction, "⚠️ Vous êtes déjà inscrit !");
       } else {
-        // Modifier les données EN MÉMOIRE
         eventData.list.push({
           id: userId,
           username: interaction.user.username,
@@ -769,7 +758,6 @@ client.on("interactionCreate", async (interaction) => {
           "✅ Vous êtes maintenant inscrit à la session !"
         );
 
-        // Mettre à jour le message Discord
         const updatedEmbed = createGrimpeEmbed(
           eventData.date,
           eventData.heure,
@@ -780,13 +768,16 @@ client.on("interactionCreate", async (interaction) => {
           eventData.guildId,
           eventData.originalDateStr
         );
-        await interaction.message.edit({ embeds: [updatedEmbed] });
 
-        // Sauvegarder dans le fichier
+        const buttons = createButtons(isAdmin(member));
+        await interaction.message.edit({ 
+          embeds: [updatedEmbed],
+          components: buttons
+        });
+
         console.log(
           `💾 Participant ajouté: ${displayName} -> événement ${messageId}`
         );
-        await saveParticipants();
       }
     } else if (interaction.customId === "absent") {
       if (!isAlreadyParticipating) {
@@ -795,7 +786,6 @@ client.on("interactionCreate", async (interaction) => {
           "⚠️ Vous n'êtes pas inscrit à cette session."
         );
       } else {
-        // Modifier les données EN MÉMOIRE
         eventData.list = eventData.list.filter((p) => p.id !== userId);
 
         await sendTemporaryReply(
@@ -803,7 +793,6 @@ client.on("interactionCreate", async (interaction) => {
           "❌ Vous avez été retiré de la liste des participants."
         );
 
-        // Mettre à jour le message Discord
         const updatedEmbed = createGrimpeEmbed(
           eventData.date,
           eventData.heure,
@@ -814,13 +803,16 @@ client.on("interactionCreate", async (interaction) => {
           eventData.guildId,
           eventData.originalDateStr
         );
-        await interaction.message.edit({ embeds: [updatedEmbed] });
 
-        // Sauvegarder dans le fichier
+        const buttons = createButtons(isAdmin(member));
+        await interaction.message.edit({ 
+          embeds: [updatedEmbed],
+          components: buttons
+        });
+
         console.log(
           `💾 Participant retiré: ${displayName} -> événement ${messageId}`
         );
-        await saveParticipants();
       }
     } else if (interaction.customId === "reminder") {
       const eventTime = getFullDateTime(eventData.date, eventData.heure);
@@ -844,21 +836,17 @@ client.on("interactionCreate", async (interaction) => {
 
       const eventReminders = reminders.get(messageId);
       if (eventReminders.has(userId)) {
-        // Supprimer le rappel EN MÉMOIRE
         eventReminders.delete(userId);
         console.log(
           `🔕 Rappel supprimé: ${interaction.user.username} -> événement ${messageId}`
         );
-        await saveReminders();
         return sendTemporaryReply(interaction, "🔕 Rappel supprimé !");
       }
 
-      // Ajouter le rappel EN MÉMOIRE
       eventReminders.set(userId, reminderTime);
       console.log(
         `🔔 Rappel configuré: ${interaction.user.username} -> événement ${messageId}`
       );
-      await saveReminders();
 
       await sendTemporaryReply(
         interaction,
