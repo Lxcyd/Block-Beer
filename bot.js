@@ -23,9 +23,9 @@ const client = new Client({
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
-const CHANNEL_ID = "1430912521833021552";
-const ROLE_ID = "1331949912740462652";
-const ALLOWED_COMMAND_CHANNELS = ["1331948319626235944", "1331948716961304596"];
+const CHANNEL_ID = "1437470666210410559";
+const ROLE_ID = "1437470692923936849";
+const ALLOWED_COMMAND_CHANNELS = ["1437470649017827338", "1331948716961304596"];
 
 const VALID_LOCATIONS = [
   "laennec",
@@ -105,12 +105,16 @@ function parseDate(dateStr) {
   if (dayIndex !== -1) {
     const currentDay = now.getDay();
     let daysToAdd = dayIndex - currentDay;
-    
+
     if (daysToAdd < 0) {
       daysToAdd += 7;
     }
-    
-    const targetDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    const targetDate = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate()
+    );
     targetDate.setDate(targetDate.getDate() + daysToAdd);
     return targetDate;
   }
@@ -244,7 +248,9 @@ async function cleanExpiredEvents() {
   }
 
   if (cleaned > 0) {
-    console.log(`🧹 ${cleaned} événement(s) expiré(s) supprimé(s) de la mémoire`);
+    console.log(
+      `🧹 ${cleaned} événement(s) expiré(s) supprimé(s) de la mémoire`
+    );
   }
 }
 
@@ -404,13 +410,20 @@ function createGrimpeEmbed(
   author,
   participantsList = [],
   guildId,
-  originalDateStr
+  originalDateStr,
+  createdAt = null
 ) {
   const parsedDate = parseDate(date);
   const dayName = getDayName(parsedDate, originalDateStr);
   const timestampTime = createTimestamp(date, heure, "t");
 
-  const embed = new EmbedBuilder().setColor("#7d9fbd").setTimestamp();
+  const embed = new EmbedBuilder().setColor("#7d9fbd");
+
+  if (createdAt) {
+    embed.setTimestamp(createdAt);
+  } else {
+    embed.setTimestamp();
+  }
 
   let description = `# Grimpe ${dayName} ${timestampTime} à ${localisation}\n\n`;
 
@@ -457,23 +470,27 @@ function createButtons(isAdmin = false) {
     .setLabel("🔔 Rappel")
     .setStyle(ButtonStyle.Primary);
 
-  const row1 = new ActionRowBuilder().addComponents(
-    presentButton,
-    absentButton,
-    reminderButton
-  );
-
   if (isAdmin) {
     const editButton = new ButtonBuilder()
       .setCustomId("edit")
       .setLabel("✏️ Modifier")
       .setStyle(ButtonStyle.Secondary);
 
-    const row2 = new ActionRowBuilder().addComponents(editButton);
-    return [row1, row2];
+    const row = new ActionRowBuilder().addComponents(
+      presentButton,
+      absentButton,
+      reminderButton,
+      editButton
+    );
+    return [row];
   }
 
-  return [row1];
+  const row = new ActionRowBuilder().addComponents(
+    presentButton,
+    absentButton,
+    reminderButton
+  );
+  return [row];
 }
 
 // ===== GESTION DES INTERACTIONS =====
@@ -559,6 +576,7 @@ client.on("interactionCreate", async (interaction) => {
       list: [],
       guildId: interaction.guildId,
       originalDateStr: date,
+      createdAt: Date.now(),
     });
 
     reminders.set(message.id, new Map());
@@ -631,7 +649,10 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   // Soumission du modal d'édition
-  if (interaction.isModalSubmit() && interaction.customId.startsWith("edit_event_")) {
+  if (
+    interaction.isModalSubmit() &&
+    interaction.customId.startsWith("edit_event_")
+  ) {
     const messageId = interaction.customId.replace("edit_event_", "");
     const eventData = participants.get(messageId);
 
@@ -644,7 +665,8 @@ client.on("interactionCreate", async (interaction) => {
 
     const newDate = interaction.fields.getTextInputValue("date");
     const newHeureInput = interaction.fields.getTextInputValue("heure");
-    const newLocalisation = interaction.fields.getTextInputValue("localisation");
+    const newLocalisation =
+      interaction.fields.getTextInputValue("localisation");
     const newInfos = interaction.fields.getTextInputValue("infos");
 
     // Valider la nouvelle date
@@ -693,7 +715,6 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
 
-    // Mettre à jour le message Discord
     const updatedEmbed = createGrimpeEmbed(
       eventData.date,
       eventData.heure,
@@ -702,21 +723,19 @@ client.on("interactionCreate", async (interaction) => {
       eventData.author,
       eventData.list,
       eventData.guildId,
-      eventData.originalDateStr
+      eventData.originalDateStr,
+      eventData.createdAt
     );
 
     const member = interaction.member;
     const buttons = createButtons(isAdmin(member));
 
-    await interaction.message.edit({ 
+    await interaction.message.edit({
       embeds: [updatedEmbed],
-      components: buttons
+      components: buttons,
     });
 
-    await sendTemporaryReply(
-      interaction,
-      "✅ Événement modifié avec succès !"
-    );
+    await sendTemporaryReply(interaction, "✅ Événement modifié avec succès !");
 
     console.log(
       `✏️ Événement ${messageId} modifié par ${interaction.user.username}`
@@ -724,7 +743,10 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   // Boutons existants (Présent, Absent, Rappel)
-  if (interaction.isButton() && ["present", "absent", "reminder"].includes(interaction.customId)) {
+  if (
+    interaction.isButton() &&
+    ["present", "absent", "reminder"].includes(interaction.customId)
+  ) {
     const messageId = interaction.message.id;
     const eventData = participants.get(messageId);
 
@@ -766,13 +788,14 @@ client.on("interactionCreate", async (interaction) => {
           eventData.author,
           eventData.list,
           eventData.guildId,
-          eventData.originalDateStr
+          eventData.originalDateStr,
+          eventData.createdAt
         );
 
         const buttons = createButtons(isAdmin(member));
-        await interaction.message.edit({ 
+        await interaction.message.edit({
           embeds: [updatedEmbed],
-          components: buttons
+          components: buttons,
         });
 
         console.log(
@@ -790,7 +813,7 @@ client.on("interactionCreate", async (interaction) => {
 
         await sendTemporaryReply(
           interaction,
-          "❌ Vous avez été retiré de la liste des participants."
+          "✅ Vous avez été retiré de la liste des participants."
         );
 
         const updatedEmbed = createGrimpeEmbed(
@@ -801,13 +824,14 @@ client.on("interactionCreate", async (interaction) => {
           eventData.author,
           eventData.list,
           eventData.guildId,
-          eventData.originalDateStr
+          eventData.originalDateStr,
+          eventData.createdAt
         );
 
         const buttons = createButtons(isAdmin(member));
-        await interaction.message.edit({ 
+        await interaction.message.edit({
           embeds: [updatedEmbed],
-          components: buttons
+          components: buttons,
         });
 
         console.log(
